@@ -122,6 +122,31 @@ internal static class CryptoSelfTest
                     // The newest xref section marks the encryption object as free.
                 }
             });
+
+            Run("Encrypted password vault round trip", delegate
+            {
+                AssertPasswordVaultRoundTrip(tempDirectory);
+            });
+
+            Run("Password vault rejects tampering", delegate
+            {
+                AssertPasswordVaultRejectsTampering(tempDirectory);
+            });
+
+            Run("Password vault rejects stale and missing updates", delegate
+            {
+                AssertPasswordVaultConcurrency(tempDirectory);
+            });
+
+            Run("Password vault rejects duplicate document types", delegate
+            {
+                AssertPasswordVaultDuplicateProtection(tempDirectory);
+            });
+
+            Run("Password document fingerprint normalization", delegate
+            {
+                AssertPasswordDocumentFingerprint(tempDirectory);
+            });
         }
         finally
         {
@@ -271,6 +296,237 @@ internal static class CryptoSelfTest
                 fileIdHex + ">] /Prev " + previousXref.ToString(CultureInfo.InvariantCulture) + " >>\n");
             WriteAscii(output, "startxref\n" + xrefOffset.ToString(CultureInfo.InvariantCulture) + "\n%%EOF\n");
         }
+    }
+
+    private static void AssertPasswordVaultRoundTrip(string directory)
+    {
+        string path = Path.Combine(directory, "round-trip-passwords.vault");
+        PasswordVault vault = new PasswordVault(path);
+        PasswordRecord first = vault.Upsert(new PasswordRecord
+        {
+            FilePath = Path.Combine(directory, "测试文档.pdf"),
+            Password = "测试密码-123",
+            Match = PasswordMatch.User,
+            PasswordEncodingCodePage = Encoding.UTF8.CodePage,
+            Note = "合成测试记录",
+            DocumentFingerprint = CreateFingerprint(1)
+        });
+
+        if (first.Id == Guid.Empty || first.CreatedUtc.Kind != DateTimeKind.Utc ||
+            first.UpdatedUtc.Kind != DateTimeKind.Utc)
+            throw new InvalidOperationException("password vault did not initialize record metadata");
+
+        byte[] fileBytes = File.ReadAllBytes(path);
+        byte[] passwordBytes = Encoding.UTF8.GetBytes(first.Password);
+        if (ContainsSequence(fileBytes, passwordBytes))
+            throw new InvalidOperationException("password vault file contains the plaintext password");
+
+        System.Collections.Generic.List<PasswordRecord> loaded = vault.Load();
+        if (loaded.Count != 1 || loaded[0].Password != first.Password || loaded[0].Note != first.Note ||
+            loaded[0].Match != PasswordMatch.User)
+            throw new InvalidOperationException("password vault round trip changed record data");
+
+        first.FilePath = Path.Combine(directory, "移动后的文档.pdf");
+        first.Note = "已更新";
+        PasswordRecord updated = vault.Upsert(first);
+        if (updated.Id != first.Id || vault.Load().Count != 1)
+            throw new InvalidOperationException("password vault update created a duplicate record");
+
+        PasswordRecord emptyPassword = vault.Upsert(new PasswordRecord
+        {
+            FilePath = Path.Combine(directory, "空密码.pdf"),
+            Password = String.Empty,
+            Match = PasswordMatch.Owner,
+            PasswordEncodingCodePage = Encoding.UTF8.CodePage,
+            Note = String.Empty,
+            DocumentFingerprint = CreateFingerprint(2)
+        });
+        loaded = vault.Load();
+        if (loaded.Count != 2 || emptyPassword.Password.Length != 0)
+            throw new InvalidOperationException("password vault did not preserve an empty password");
+
+        vault.Delete(updated.Id);
+        loaded = vault.Load();
+        if (loaded.Count != 1 || loaded[0].Id != emptyPassword.Id)
+            throw new InvalidOperationException("password vault delete removed the wrong record");
+    }
+
+    private static void AssertPasswordVaultRejectsTampering(string directory)
+    {
+        string path = Path.Combine(directory, "tampered-passwords.vault");
+        PasswordVault vault = new PasswordVault(path);
+        vault.Upsert(new PasswordRecord
+        {
+            FilePath = Path.Combine(directory, "tamper.pdf"),
+            Password = "synthetic-vault-password",
+            Match = PasswordMatch.User,
+            PasswordEncodingCodePage = Encoding.UTF8.CodePage,
+            Note = String.Empty,
+            DocumentFingerprint = CreateFingerprint(3)
+        });
+
+        byte[] damaged = File.ReadAllBytes(path);
+        damaged[damaged.Length - 1] ^= 0x40;
+        File.WriteAllBytes(path, damaged);
+
+        AssertVaultFailure(delegate { vault.Load(); }, "tampered vault load");
+        AssertVaultFailure(delegate
+        {
+            vault.Upsert(new PasswordRecord
+            {
+                FilePath = Path.Combine(directory, "must-not-overwrite.pdf"),
+                Password = "another-synthetic-password",
+                Match = PasswordMatch.User,
+                PasswordEncodingCodePage = Encoding.UTF8.CodePage,
+                Note = String.Empty,
+                DocumentFingerprint = CreateFingerprint(4)
+            });
+        }, "tampered vault update");
+
+        byte[] afterFailure = File.ReadAllBytes(path);
+        if (!ByteArraysEqual(damaged, afterFailure))
+            throw new InvalidOperationException("failed vault update overwrote the damaged source file");
+    }
+
+    private static void AssertPasswordVaultConcurrency(string directory)
+    {
+        string path = Path.Combine(directory, "concurrent-passwords.vault");
+        PasswordVault firstVault = new PasswordVault(path);
+        PasswordRecord created = firstVault.Upsert(new PasswordRecord
+        {
+            FilePath = Path.Combine(directory, "concurrent.pdf"),
+            Password = "initial-password",
+            Match = PasswordMatch.User,
+            PasswordEncodingCodePage = Encoding.UTF8.CodePage,
+            Note = "initial",
+            DocumentFingerprint = CreateFingerprint(5)
+        });
+
+        PasswordVault secondVault = new PasswordVault(path);
+        PasswordRecord stale = firstVault.Load()[0];
+        PasswordRecord current = secondVault.Load()[0];
+        current.Note = "second writer";
+        current.UpdatedUtc = DateTime.UtcNow;
+        PasswordRecord secondWrite = secondVault.Upsert(current);
+
+        stale.Note = "stale first writer";
+        stale.UpdatedUtc = DateTime.UtcNow;
+        AssertVaultFailure(delegate { firstVault.Upsert(stale); }, "stale vault update");
+
+        PasswordRecord afterConflict = firstVault.Load()[0];
+        if (afterConflict.Id != created.Id || afterConflict.Note != secondWrite.Note)
+            throw new InvalidOperationException("stale update changed the current vault record");
+
+        PasswordRecord missing = afterConflict.Clone();
+        missing.Id = Guid.NewGuid();
+        missing.Note = "must not be inserted";
+        missing.UpdatedUtc = DateTime.UtcNow;
+        AssertVaultFailure(delegate { firstVault.Upsert(missing); }, "missing-id vault update");
+
+        System.Collections.Generic.List<PasswordRecord> finalRecords = firstVault.Load();
+        if (finalRecords.Count != 1 || finalRecords[0].Id != created.Id ||
+            finalRecords[0].Note != secondWrite.Note)
+            throw new InvalidOperationException("missing-id update inserted or replaced a vault record");
+    }
+
+    private static void AssertVaultFailure(Action action, string caseName)
+    {
+        try
+        {
+            action();
+        }
+        catch (PasswordVaultException)
+        {
+            return;
+        }
+        throw new InvalidOperationException(caseName + " unexpectedly succeeded");
+    }
+
+    private static void AssertPasswordVaultDuplicateProtection(string directory)
+    {
+        string path = Path.Combine(directory, "duplicate-passwords.vault");
+        PasswordVault vault = new PasswordVault(path);
+        PasswordRecord first = vault.Upsert(new PasswordRecord
+        {
+            FilePath = Path.Combine(directory, "first.pdf"),
+            Password = "first-password",
+            Match = PasswordMatch.User,
+            PasswordEncodingCodePage = Encoding.UTF8.CodePage,
+            Note = String.Empty,
+            DocumentFingerprint = CreateFingerprint(6)
+        });
+
+        AssertVaultFailure(delegate
+        {
+            vault.Upsert(new PasswordRecord
+            {
+                FilePath = Path.Combine(directory, "duplicate.pdf"),
+                Password = "must-not-overwrite",
+                Match = PasswordMatch.User,
+                PasswordEncodingCodePage = Encoding.UTF8.CodePage,
+                Note = String.Empty,
+                DocumentFingerprint = CreateFingerprint(6)
+            });
+        }, "duplicate document/type insert");
+
+        PasswordRecord second = vault.Upsert(new PasswordRecord
+        {
+            FilePath = Path.Combine(directory, "second.pdf"),
+            Password = "second-password",
+            Match = PasswordMatch.User,
+            PasswordEncodingCodePage = Encoding.UTF8.CodePage,
+            Note = String.Empty,
+            DocumentFingerprint = CreateFingerprint(7)
+        });
+        second.DocumentFingerprint = CreateFingerprint(6);
+        AssertVaultFailure(delegate { vault.Upsert(second); }, "duplicate document/type update");
+
+        System.Collections.Generic.List<PasswordRecord> records = vault.Load();
+        if (records.Count != 2 || records[0].Password == "must-not-overwrite" ||
+            records[1].Password == "must-not-overwrite" || first.Id == second.Id)
+            throw new InvalidOperationException("duplicate protection changed existing records");
+    }
+
+    private static byte[] CreateFingerprint(byte seed)
+    {
+        byte[] result = new byte[32];
+        for (int i = 0; i < result.Length; i++) result[i] = (byte)(seed + i);
+        return result;
+    }
+
+    private static void AssertPasswordDocumentFingerprint(string directory)
+    {
+        string path = Path.Combine(directory, "Folder", "Document.pdf");
+        string equivalentPath = Path.Combine(directory, ".", "folder", "DOCUMENT.PDF");
+        string differentPath = Path.Combine(directory, "Folder", "Other.pdf");
+        byte[] first = PasswordDocumentFingerprint.FromPath(path);
+        byte[] equivalent = PasswordDocumentFingerprint.FromPath(equivalentPath);
+        byte[] different = PasswordDocumentFingerprint.FromPath(differentPath);
+
+        if (!ByteArraysEqual(first, equivalent))
+            throw new InvalidOperationException("equivalent Windows paths produced different fingerprints");
+        if (ByteArraysEqual(first, different))
+            throw new InvalidOperationException("different paths produced the same fingerprint");
+    }
+
+    private static bool ContainsSequence(byte[] haystack, byte[] needle)
+    {
+        if (needle.Length == 0) return true;
+        for (int index = 0; index <= haystack.Length - needle.Length; index++)
+        {
+            int offset = 0;
+            while (offset < needle.Length && haystack[index + offset] == needle[offset]) offset++;
+            if (offset == needle.Length) return true;
+        }
+        return false;
+    }
+
+    private static bool ByteArraysEqual(byte[] left, byte[] right)
+    {
+        if (left.Length != right.Length) return false;
+        int difference = 0;
+        for (int i = 0; i < left.Length; i++) difference |= left[i] ^ right[i];
+        return difference == 0;
     }
 
     private static void AssertEqual(PasswordMatch expected, PasswordMatch actual, string caseName)

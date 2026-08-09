@@ -47,10 +47,12 @@ namespace PdfPasswordRecovery
         private readonly CheckBox showPasswordBox = CreateCheckBox("显示密码");
         private readonly Button copyButton = CreateSecondaryButton("复制");
         private readonly Button saveButton = CreateSecondaryButton("保存结果");
+        private readonly Button passwordManagerButton = CreateHeaderButton("密码管理");
         private readonly RichTextBox logBox = new RichTextBox();
         private readonly Timer uiTimer = new Timer();
 
         private readonly DictionaryAttack attack = new DictionaryAttack();
+        private readonly PasswordVault passwordVault = new PasswordVault();
         private PdfSecurityInfo securityInfo;
         private DictionaryInfo dictionaryInfo;
         private int pdfLoadVersion;
@@ -140,10 +142,19 @@ namespace PdfPasswordRecovery
             statusLabel.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             statusLabel.Location = new Point(ClientSize.Width - 108, 22);
 
+            passwordManagerButton.Size = new Size(104, 30);
+            passwordManagerButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            passwordManagerButton.Location = new Point(statusLabel.Left - passwordManagerButton.Width - 12, 22);
+
             header.Controls.Add(title);
             header.Controls.Add(subtitle);
+            header.Controls.Add(passwordManagerButton);
             header.Controls.Add(statusLabel);
-            header.Resize += delegate { statusLabel.Left = header.ClientSize.Width - statusLabel.Width - 24; };
+            header.Resize += delegate
+            {
+                statusLabel.Left = header.ClientSize.Width - statusLabel.Width - 24;
+                passwordManagerButton.Left = statusLabel.Left - passwordManagerButton.Width - 12;
+            };
             return header;
         }
 
@@ -398,6 +409,7 @@ namespace PdfPasswordRecovery
             showPasswordBox.CheckedChanged += delegate { UpdateResultDisplay(); };
             copyButton.Click += delegate { CopyRecoveredPassword(); };
             saveButton.Click += delegate { SaveResult(); };
+            passwordManagerButton.Click += delegate { OpenPasswordManager(); };
             attack.Completed += delegate
             {
                 if (!IsDisposed && IsHandleCreated)
@@ -443,6 +455,7 @@ namespace PdfPasswordRecovery
             SetAccessibility(showPasswordBox, "显示恢复出的密码", AccessibleRole.CheckButton);
             SetAccessibility(copyButton, "复制恢复出的密码", AccessibleRole.PushButton);
             SetAccessibility(saveButton, "保存密码恢复结果", AccessibleRole.PushButton);
+            SetAccessibility(passwordManagerButton, "打开密码管理", AccessibleRole.PushButton);
         }
 
         private void BrowsePdf()
@@ -671,6 +684,7 @@ namespace PdfPasswordRecovery
             copyButton.Enabled = hasRecoveredPassword;
             saveButton.Enabled = hasRecoveredPassword;
             showPasswordBox.Enabled = hasRecoveredPassword && recoveredPassword.Length > 0;
+            passwordManagerButton.Enabled = !active;
 
             ApplyButtonAppearance(choosePdfButton, Color.White, Ink, Line);
             ApplyButtonAppearance(chooseDictionaryButton, Color.White, Ink, Line);
@@ -679,6 +693,48 @@ namespace PdfPasswordRecovery
             ApplyButtonAppearance(stopButton, Color.White, Danger, Color.FromArgb(222, 172, 172));
             ApplyButtonAppearance(copyButton, Color.White, Ink, Line);
             ApplyButtonAppearance(saveButton, Color.White, Ink, Line);
+            ApplyHeaderButtonAppearance(passwordManagerButton);
+        }
+
+        private void OpenPasswordManager()
+        {
+            PasswordRecord currentResult = CreateCurrentPasswordRecord();
+            try
+            {
+                using (PasswordManagerForm form = new PasswordManagerForm(passwordVault, currentResult))
+                {
+                    if (Icon != null) form.Icon = (Icon)Icon.Clone();
+                    form.ShowDialog(this);
+                }
+            }
+            catch (Exception ex)
+            {
+                AppendLog("密码管理打开失败：" + ex.Message, Danger);
+                MessageBox.Show(this, "无法打开密码管理。\r\n\r\n" + ex.Message,
+                    "密码管理", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private PasswordRecord CreateCurrentPasswordRecord()
+        {
+            if (!hasRecoveredPassword) return null;
+
+            AttackSnapshot snapshot = attack.GetSnapshot();
+            int codePage;
+            try { codePage = GetPasswordEncoding().CodePage; }
+            catch { codePage = Encoding.UTF8.CodePage; }
+
+            string filePath = securityInfo == null ? pdfPathBox.Text : securityInfo.FilePath;
+            return new PasswordRecord
+            {
+                Id = Guid.Empty,
+                FilePath = filePath,
+                Password = recoveredPassword,
+                Match = snapshot.Match,
+                PasswordEncodingCodePage = codePage,
+                Note = String.Empty,
+                DocumentFingerprint = PasswordDocumentFingerprint.FromPath(filePath)
+            };
         }
 
         private void SaveResult()
@@ -783,6 +839,14 @@ namespace PdfPasswordRecovery
             button.BackColor = button.Enabled ? enabledBackColor : DisabledBack;
             button.ForeColor = button.Enabled ? enabledForeColor : DisabledInk;
             button.FlatAppearance.BorderColor = button.Enabled ? enabledBorderColor : DisabledLine;
+            button.Cursor = button.Enabled ? Cursors.Hand : Cursors.Default;
+        }
+
+        private static void ApplyHeaderButtonAppearance(Button button)
+        {
+            button.BackColor = button.Enabled ? Color.FromArgb(40, 55, 63) : Color.FromArgb(48, 59, 65);
+            button.ForeColor = button.Enabled ? Color.White : Color.FromArgb(128, 141, 149);
+            button.FlatAppearance.BorderColor = button.Enabled ? Color.FromArgb(104, 124, 134) : Color.FromArgb(67, 79, 86);
             button.Cursor = button.Enabled ? Cursors.Hand : Cursors.Default;
         }
 
@@ -987,6 +1051,17 @@ namespace PdfPasswordRecovery
             button.BackColor = Accent;
             button.ForeColor = Color.White;
             button.FlatAppearance.MouseOverBackColor = AccentDark;
+            return button;
+        }
+
+        private static Button CreateHeaderButton(string text)
+        {
+            Button button = CreateFlatButton(text);
+            button.BackColor = Color.FromArgb(40, 55, 63);
+            button.ForeColor = Color.White;
+            button.FlatAppearance.BorderColor = Color.FromArgb(104, 124, 134);
+            button.FlatAppearance.BorderSize = 1;
+            button.FlatAppearance.MouseOverBackColor = Color.FromArgb(50, 69, 78);
             return button;
         }
 

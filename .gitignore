@@ -6,6 +6,10 @@
 # Local PDF samples
 /*.pdf
 
+# Local encrypted password vaults
+*.vault
+*.vault.*.tmp
+
 # Visual Studio user state
 /.vs/
 *.suo
