@@ -38,6 +38,12 @@ namespace PdfPasswordRecovery
         }
     }
 
+    internal sealed class PasswordVaultMutationResult
+    {
+        public PasswordRecord SavedRecord;
+        public List<PasswordRecord> Records;
+    }
+
     internal sealed class PasswordVaultException : Exception
     {
         public PasswordVaultException(string message)
@@ -52,9 +58,8 @@ namespace PdfPasswordRecovery
     }
 
     internal sealed class PasswordVault
+        : IDisposable
     {
-        private const int ContainerVersion = 1;
-        private const int PlaintextVersion = 1;
         private const int MaximumVaultBytes = 16 * 1024 * 1024;
         private const int MaximumRecords = 100000;
         private const int MaximumPathBytes = 32768;
@@ -63,44 +68,56 @@ namespace PdfPasswordRecovery
         private const int FingerprintLength = 32;
         private const int MutexWaitMilliseconds = 15000;
 
-        private static readonly byte[] ContainerMagic = new byte[]
-        {
-            (byte)'P', (byte)'D', (byte)'F', (byte)'V', (byte)'A', (byte)'U', (byte)'L', (byte)'T'
-        };
-
-        private static readonly byte[] PlaintextMagic = new byte[]
-        {
-            (byte)'P', (byte)'D', (byte)'F', (byte)'P', (byte)'W', (byte)'D', (byte)'0', (byte)'1'
-        };
-
-        private static readonly byte[] AdditionalEntropy = Encoding.ASCII.GetBytes(
-            "PdfPasswordRecovery.PasswordVault.v1");
-
         private static readonly UTF8Encoding StrictUtf8 = new UTF8Encoding(false, true);
         private readonly string mutexName;
         private readonly Dictionary<Guid, DateTime> observedVersions = new Dictionary<Guid, DateTime>();
+        private readonly PasswordVaultStorage storage;
+        private bool disposed;
 
-        public PasswordVault()
-            : this(Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "PdfPasswordRecovery",
-                "passwords.vault"))
-        {
-        }
+        public static string DefaultPlaintextStoragePath { get { return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "PdfPasswordRecovery", "passwords.json"); } }
 
-        internal PasswordVault(string storagePath)
+        public static string DefaultAes256StoragePath { get { return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "PdfPasswordRecovery", "passwords.aesvault"); } }
+
+        private PasswordVault(string storagePath, PasswordVaultStorageMode mode, string password)
         {
             if (String.IsNullOrWhiteSpace(storagePath))
                 throw new ArgumentException("密码库路径不能为空。", "storagePath");
 
             StoragePath = Path.GetFullPath(storagePath);
             mutexName = CreateMutexName(StoragePath);
+            storage = new PasswordVaultStorage(mode, password);
         }
 
         public string StoragePath { get; private set; }
+        public PasswordVaultStorageMode StorageMode { get { return storage.Mode; } }
+
+        public static PasswordVault OpenPlaintext()
+        {
+            return OpenPlaintext(DefaultPlaintextStoragePath);
+        }
+
+        public static PasswordVault OpenPlaintext(string storagePath)
+        {
+            return new PasswordVault(storagePath, PasswordVaultStorageMode.PlaintextJson, null);
+        }
+
+        public static PasswordVault OpenAes256(string password)
+        {
+            return OpenAes256(DefaultAes256StoragePath, password);
+        }
+
+        public static PasswordVault OpenAes256(string storagePath, string password)
+        {
+            return new PasswordVault(storagePath, PasswordVaultStorageMode.Aes256, password);
+        }
 
         public List<PasswordRecord> Load()
         {
+            ThrowIfDisposed();
             return WithMutex(delegate
             {
                 bool storageExists;
@@ -112,6 +129,12 @@ namespace PdfPasswordRecovery
 
         public PasswordRecord Upsert(PasswordRecord record)
         {
+            return UpsertWithSnapshot(record).SavedRecord;
+        }
+
+        internal PasswordVaultMutationResult UpsertWithSnapshot(PasswordRecord record)
+        {
+            ThrowIfDisposed();
             if (record == null) throw new ArgumentNullException("record");
             PasswordRecord input = record.Clone();
 
@@ -159,15 +182,25 @@ namespace PdfPasswordRecovery
 
                 SaveUnlocked(records, storageExists);
                 RememberObservedVersions(records);
-                return input.Clone();
+                return new PasswordVaultMutationResult
+                {
+                    SavedRecord = input.Clone(),
+                    Records = CloneRecords(records)
+                };
             });
         }
 
         public void Delete(Guid id)
         {
+            DeleteWithSnapshot(id);
+        }
+
+        internal PasswordVaultMutationResult DeleteWithSnapshot(Guid id)
+        {
+            ThrowIfDisposed();
             if (id == Guid.Empty) throw new ArgumentException("密码记录标识不能为空。", "id");
 
-            WithMutex(delegate
+            return WithMutex(delegate
             {
                 bool storageExists;
                 List<PasswordRecord> records = LoadUnlocked(out storageExists);
@@ -178,17 +211,20 @@ namespace PdfPasswordRecovery
                     EnsureDeleteIsCurrent(records[index]);
                     records.RemoveAt(index);
                     SaveUnlocked(records, storageExists);
-                    RememberObservedVersions(records);
                 }
-                return true;
+                RememberObservedVersions(records);
+                return new PasswordVaultMutationResult
+                {
+                    SavedRecord = null,
+                    Records = CloneRecords(records)
+                };
             });
         }
 
         private List<PasswordRecord> LoadUnlocked(out bool storageExists)
         {
             storageExists = false;
-            byte[] protectedBytes = null;
-            byte[] plaintext = null;
+            byte[] fileBytes = null;
             try
             {
                 FileStream stream;
@@ -209,39 +245,21 @@ namespace PdfPasswordRecovery
                 storageExists = true;
                 using (stream)
                 {
-                    if (stream.Length < ContainerMagic.Length + 8 || stream.Length > MaximumVaultBytes)
-                        throw new PasswordVaultException("密码库文件长度无效或超过 16 MiB 上限。");
-
-                    using (BinaryReader reader = new BinaryReader(stream, Encoding.UTF8, true))
+                    if (stream.Length <= 0 || stream.Length > MaximumVaultBytes)
+                        throw new PasswordVaultException("密码库文件为空、无效或超过 16 MiB 上限。");
+                    fileBytes = new byte[(int)stream.Length];
+                    int offset = 0;
+                    while (offset < fileBytes.Length)
                     {
-                        RequireMagic(ReadExact(reader, ContainerMagic.Length), ContainerMagic, "密码库文件头无效。");
-                        int version = reader.ReadInt32();
-                        if (version != ContainerVersion)
-                            throw new PasswordVaultException("密码库文件版本不受支持。");
-
-                        int protectedLength = reader.ReadInt32();
-                        long remaining = stream.Length - stream.Position;
-                        if (protectedLength <= 0 || protectedLength > MaximumVaultBytes || remaining != protectedLength)
-                            throw new PasswordVaultException("密码库加密数据长度无效。");
-                        protectedBytes = ReadExact(reader, protectedLength);
+                        int read = stream.Read(fileBytes, offset, fileBytes.Length - offset);
+                        if (read <= 0) throw new EndOfStreamException();
+                        offset += read;
                     }
                 }
 
-                try
-                {
-                    plaintext = ProtectedData.Unprotect(
-                        protectedBytes, AdditionalEntropy, DataProtectionScope.CurrentUser);
-                }
-                catch (CryptographicException exception)
-                {
-                    throw new PasswordVaultException(
-                        "无法解密密码库。文件可能已损坏，或不属于当前 Windows 用户。", exception);
-                }
-
-                if (plaintext == null || plaintext.Length == 0 || plaintext.Length > MaximumVaultBytes)
-                    throw new PasswordVaultException("密码库明文长度无效或超过 16 MiB 上限。");
-
-                return DeserializePlaintext(plaintext);
+                List<PasswordRecord> records = storage.Decode(fileBytes);
+                ValidateRecordSet(records);
+                return records;
             }
             catch (PasswordVaultException)
             {
@@ -261,29 +279,20 @@ namespace PdfPasswordRecovery
             }
             finally
             {
-                ClearBytes(plaintext);
-                ClearBytes(protectedBytes);
+                ClearBytes(fileBytes);
             }
         }
 
         private void SaveUnlocked(List<PasswordRecord> records, bool storageExistedAtLoad)
         {
-            byte[] plaintext = null;
-            byte[] protectedBytes = null;
-            byte[] container = null;
+            byte[] fileBytes = null;
             string temporaryPath = null;
 
             try
             {
-                plaintext = SerializePlaintext(records);
-                protectedBytes = ProtectedData.Protect(
-                    plaintext, AdditionalEntropy, DataProtectionScope.CurrentUser);
-                if (protectedBytes == null || protectedBytes.Length == 0 ||
-                    protectedBytes.Length > MaximumVaultBytes)
-                    throw new PasswordVaultException("密码库加密数据超过 16 MiB 上限。");
-
-                container = BuildContainer(protectedBytes);
-                if (container.Length > MaximumVaultBytes)
+                ValidateRecordSet(records);
+                fileBytes = storage.Encode(records);
+                if (fileBytes == null || fileBytes.Length == 0 || fileBytes.Length > MaximumVaultBytes)
                     throw new PasswordVaultException("密码库文件超过 16 MiB 上限。");
 
                 string directory = Path.GetDirectoryName(StoragePath);
@@ -299,7 +308,7 @@ namespace PdfPasswordRecovery
                     temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
                     4096, FileOptions.WriteThrough))
                 {
-                    stream.Write(container, 0, container.Length);
+                    stream.Write(fileBytes, 0, fileBytes.Length);
                     stream.Flush(true);
                 }
 
@@ -317,10 +326,6 @@ namespace PdfPasswordRecovery
             {
                 throw;
             }
-            catch (CryptographicException exception)
-            {
-                throw new PasswordVaultException("加密密码库失败。", exception);
-            }
             catch (UnauthorizedAccessException exception)
             {
                 throw new PasswordVaultException("没有权限写入密码库文件。", exception);
@@ -336,137 +341,28 @@ namespace PdfPasswordRecovery
                     try { File.Delete(temporaryPath); }
                     catch { }
                 }
-                ClearBytes(container);
-                ClearBytes(protectedBytes);
-                ClearBytes(plaintext);
+                ClearBytes(fileBytes);
             }
         }
 
-        private static byte[] SerializePlaintext(List<PasswordRecord> records)
+        private static void ValidateRecordSet(List<PasswordRecord> records)
         {
             if (records == null) throw new PasswordVaultException("密码库记录集合无效。");
             if (records.Count > MaximumRecords) throw new PasswordVaultException("密码库记录数量超过上限。");
 
             HashSet<Guid> identifiers = new HashSet<Guid>();
-            using (MemoryStream stream = new MemoryStream())
-            using (BinaryWriter writer = new BinaryWriter(stream, Encoding.UTF8, true))
+            HashSet<string> documentTypes = new HashSet<string>(StringComparer.Ordinal);
+            for (int i = 0; i < records.Count; i++)
             {
-                try
-                {
-                    writer.Write(PlaintextMagic);
-                    writer.Write(PlaintextVersion);
-                    writer.Write(records.Count);
-
-                    for (int i = 0; i < records.Count; i++)
-                    {
-                        PasswordRecord record = records[i];
-                        ValidateRecord(record);
-                        if (!identifiers.Add(record.Id))
-                            throw new PasswordVaultException("密码库包含重复的记录标识。");
-
-                        writer.Write(record.Id.ToByteArray());
-                        WriteString(writer, record.FilePath, MaximumPathBytes, "PDF 路径");
-                        WriteString(writer, record.Password, MaximumPasswordBytes, "密码");
-                        writer.Write((int)record.Match);
-                        writer.Write(record.PasswordEncodingCodePage);
-                        WriteString(writer, record.Note, MaximumNoteBytes, "备注");
-                        writer.Write(record.CreatedUtc.Ticks);
-                        writer.Write(record.UpdatedUtc.Ticks);
-                        writer.Write(record.DocumentFingerprint);
-
-                        if (stream.Length > MaximumVaultBytes)
-                            throw new PasswordVaultException("密码库明文超过 16 MiB 上限。");
-                    }
-
-                    writer.Flush();
-                    if (stream.Length > MaximumVaultBytes)
-                        throw new PasswordVaultException("密码库明文超过 16 MiB 上限。");
-                    return stream.ToArray();
-                }
-                finally
-                {
-                    byte[] buffer = stream.GetBuffer();
-                    ClearBytes(buffer);
-                }
-            }
-        }
-
-        private static List<PasswordRecord> DeserializePlaintext(byte[] plaintext)
-        {
-            List<PasswordRecord> records = new List<PasswordRecord>();
-            HashSet<Guid> identifiers = new HashSet<Guid>();
-
-            try
-            {
-                using (MemoryStream stream = new MemoryStream(plaintext, false))
-                using (BinaryReader reader = new BinaryReader(stream, Encoding.UTF8, true))
-                {
-                    RequireMagic(ReadExact(reader, PlaintextMagic.Length), PlaintextMagic, "密码库明文文件头无效。");
-                    int version = reader.ReadInt32();
-                    if (version != PlaintextVersion)
-                        throw new PasswordVaultException("密码库明文版本不受支持。");
-
-                    int count = reader.ReadInt32();
-                    if (count < 0 || count > MaximumRecords)
-                        throw new PasswordVaultException("密码库记录数量无效。");
-
-                    for (int i = 0; i < count; i++)
-                    {
-                        PasswordRecord record = new PasswordRecord
-                        {
-                            Id = new Guid(ReadExact(reader, 16)),
-                            FilePath = ReadString(reader, MaximumPathBytes, "PDF 路径"),
-                            Password = ReadString(reader, MaximumPasswordBytes, "密码"),
-                            Match = (PasswordMatch)reader.ReadInt32(),
-                            PasswordEncodingCodePage = reader.ReadInt32(),
-                            Note = ReadString(reader, MaximumNoteBytes, "备注"),
-                            CreatedUtc = ReadUtcDateTime(reader.ReadInt64(), "创建时间"),
-                            UpdatedUtc = ReadUtcDateTime(reader.ReadInt64(), "更新时间"),
-                            DocumentFingerprint = ReadExact(reader, FingerprintLength)
-                        };
-
-                        ValidateRecord(record);
-                        record.ExpectedUpdatedUtc = record.UpdatedUtc;
-                        if (!identifiers.Add(record.Id))
-                            throw new PasswordVaultException("密码库包含重复的记录标识。");
-                        records.Add(record);
-                    }
-
-                    if (stream.Position != stream.Length)
-                        throw new PasswordVaultException("密码库明文包含多余数据。");
-                }
-            }
-            catch (PasswordVaultException)
-            {
-                throw;
-            }
-            catch (EndOfStreamException exception)
-            {
-                throw new PasswordVaultException("密码库明文已截断。", exception);
-            }
-            catch (DecoderFallbackException)
-            {
-                throw new PasswordVaultException("密码库包含无效的 UTF-8 文本。");
-            }
-            catch (ArgumentException exception)
-            {
-                throw new PasswordVaultException("密码库包含无效字段。", exception);
-            }
-
-            return records;
-        }
-
-        private static byte[] BuildContainer(byte[] protectedBytes)
-        {
-            using (MemoryStream stream = new MemoryStream())
-            using (BinaryWriter writer = new BinaryWriter(stream, Encoding.UTF8, true))
-            {
-                writer.Write(ContainerMagic);
-                writer.Write(ContainerVersion);
-                writer.Write(protectedBytes.Length);
-                writer.Write(protectedBytes);
-                writer.Flush();
-                return stream.ToArray();
+                PasswordRecord record = records[i];
+                ValidateRecord(record);
+                if (!identifiers.Add(record.Id))
+                    throw new PasswordVaultException("密码库包含重复的记录标识。");
+                string documentType = ((int)record.Match).ToString() + ":" +
+                    Convert.ToBase64String(record.DocumentFingerprint);
+                if (!documentTypes.Add(documentType))
+                    throw new PasswordVaultException("密码库包含重复的 PDF 密码类型条目。");
+                record.ExpectedUpdatedUtc = record.UpdatedUtc;
             }
         }
 
@@ -563,58 +459,6 @@ namespace PdfPasswordRecovery
             throw new PasswordVaultException("密码记录的创建时间必须为 UTC。");
         }
 
-        private static DateTime ReadUtcDateTime(long ticks, string fieldName)
-        {
-            try
-            {
-                return new DateTime(ticks, DateTimeKind.Utc);
-            }
-            catch (ArgumentOutOfRangeException)
-            {
-                throw new PasswordVaultException("密码记录的" + fieldName + "无效。");
-            }
-        }
-
-        private static void WriteString(BinaryWriter writer, string value, int maximumBytes, string fieldName)
-        {
-            int byteCount = GetUtf8ByteCount(value, maximumBytes, fieldName);
-            byte[] bytes = null;
-            try
-            {
-                bytes = StrictUtf8.GetBytes(value);
-                writer.Write(byteCount);
-                writer.Write(bytes);
-            }
-            catch (EncoderFallbackException)
-            {
-                throw new PasswordVaultException("密码记录的" + fieldName + "包含无效字符。");
-            }
-            finally
-            {
-                ClearBytes(bytes);
-            }
-        }
-
-        private static string ReadString(BinaryReader reader, int maximumBytes, string fieldName)
-        {
-            int byteCount = reader.ReadInt32();
-            if (byteCount < 0 || byteCount > maximumBytes)
-                throw new PasswordVaultException("密码记录的" + fieldName + "长度无效。");
-            byte[] bytes = ReadExact(reader, byteCount);
-            try
-            {
-                return StrictUtf8.GetString(bytes);
-            }
-            catch (DecoderFallbackException)
-            {
-                throw new PasswordVaultException("密码记录的" + fieldName + "不是有效 UTF-8 文本。");
-            }
-            finally
-            {
-                ClearBytes(bytes);
-            }
-        }
-
         private static int GetUtf8ByteCount(string value, int maximumBytes, string fieldName)
         {
             if (value == null) throw new PasswordVaultException("密码记录缺少" + fieldName + "字段。");
@@ -630,29 +474,6 @@ namespace PdfPasswordRecovery
             if (byteCount > maximumBytes)
                 throw new PasswordVaultException("密码记录的" + fieldName + "超过长度上限。");
             return byteCount;
-        }
-
-        private static byte[] ReadExact(BinaryReader reader, int count)
-        {
-            byte[] bytes = reader.ReadBytes(count);
-            if (bytes.Length != count)
-            {
-                ClearBytes(bytes);
-                throw new EndOfStreamException();
-            }
-            return bytes;
-        }
-
-        private static void RequireMagic(byte[] actual, byte[] expected, string errorMessage)
-        {
-            try
-            {
-                if (!FixedTimeEquals(actual, expected)) throw new PasswordVaultException(errorMessage);
-            }
-            finally
-            {
-                ClearBytes(actual);
-            }
         }
 
         private static bool FixedTimeEquals(byte[] left, byte[] right)
@@ -730,6 +551,19 @@ namespace PdfPasswordRecovery
                 ClearBytes(hash);
                 ClearBytes(pathBytes);
             }
+        }
+
+        private void ThrowIfDisposed()
+        {
+            if (disposed) throw new ObjectDisposedException("PasswordVault");
+        }
+
+        public void Dispose()
+        {
+            if (disposed) return;
+            disposed = true;
+            observedVersions.Clear();
+            storage.Dispose();
         }
 
         private static void ClearBytes(byte[] bytes)

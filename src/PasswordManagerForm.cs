@@ -84,9 +84,11 @@ namespace PdfPasswordRecovery
             }
         }
 
-        public PasswordManagerForm(PasswordVault vault, PasswordRecord currentResult)
+        public PasswordManagerForm(PasswordVault vault, PasswordRecord currentResult,
+            List<PasswordRecord> initialRecords)
         {
             if (vault == null) throw new ArgumentNullException("vault");
+            if (initialRecords == null) throw new ArgumentNullException("initialRecords");
             this.vault = vault;
             this.currentResult = currentResult == null ? null : currentResult.Clone();
 
@@ -106,7 +108,7 @@ namespace PdfPasswordRecovery
             Controls.Add(BuildLayout());
             ConfigureAccessibility();
             WireEvents();
-            LoadRecords(null);
+            ApplyRecords(initialRecords, null);
             SetEditorMode(EditorMode.View, null);
         }
 
@@ -269,7 +271,7 @@ namespace PdfPasswordRecovery
             };
             Label subtitle = new Label
             {
-                Text = "本机密码库",
+                Text = FormatVaultSubtitle(),
                 AutoSize = true,
                 ForeColor = Color.FromArgb(184, 196, 203),
                 Font = new Font("Microsoft YaHei UI", 8.5F),
@@ -541,24 +543,18 @@ namespace PdfPasswordRecovery
             encodingBox.SelectedIndexChanged += delegate { MarkEditorDirty(); };
         }
 
-        private void LoadRecords(Guid? selectId)
+        private void ApplyRecords(List<PasswordRecord> snapshot, Guid? selectId)
         {
-            try
+            records = snapshot ?? new List<PasswordRecord>();
+            records.Sort(delegate(PasswordRecord left, PasswordRecord right)
             {
-                records = vault.Load() ?? new List<PasswordRecord>();
-                records.Sort(delegate(PasswordRecord left, PasswordRecord right)
-                {
-                    return right.UpdatedUtc.CompareTo(left.UpdatedUtc);
-                });
-                SetStatus(String.Empty);
-            }
-            catch (Exception ex)
-            {
-                records = new List<PasswordRecord>();
-                SetStatus("密码库读取失败");
-                MessageBox.Show(this, "无法读取密码库。\r\n\r\n" + ex.Message,
-                    "读取失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
+                return right.UpdatedUtc.CompareTo(left.UpdatedUtc);
+            });
+            transientStatus = String.Empty;
+
+            PasswordRecord selected = selectId.HasValue ? FindById(selectId.Value) : null;
+            if (selected != null && !MatchesSearch(selected, searchBox.Text.Trim()))
+                searchBox.Clear();
             RefreshGrid(selectId);
         }
 
@@ -764,9 +760,11 @@ namespace PdfPasswordRecovery
         {
             try
             {
-                PasswordRecord saved = vault.Upsert(record);
-                LoadRecords(saved.Id);
-                PopulateEditor(FindById(saved.Id), EditorMode.View);
+                PasswordVaultMutationResult result = vault.UpsertWithSnapshot(record);
+                if (result == null || result.SavedRecord == null || result.Records == null)
+                    throw new InvalidOperationException("密码库未返回已保存的条目。");
+                ApplyRecords(result.Records, result.SavedRecord.Id);
+                PopulateEditor(FindById(result.SavedRecord.Id), EditorMode.View);
                 SetStatus(successMessage);
             }
             catch (Exception ex)
@@ -801,8 +799,10 @@ namespace PdfPasswordRecovery
                 MessageBoxIcon.Warning) != DialogResult.Yes) return;
             try
             {
-                vault.Delete(selected.Id);
-                LoadRecords(null);
+                PasswordVaultMutationResult result = vault.DeleteWithSnapshot(selected.Id);
+                if (result == null || result.Records == null)
+                    throw new InvalidOperationException("密码库未返回删除后的快照。");
+                ApplyRecords(result.Records, null);
                 SetStatus("条目已删除。");
             }
             catch (Exception ex)
@@ -1145,6 +1145,15 @@ namespace PdfPasswordRecovery
             if (value == DateTime.MinValue) return String.Empty;
             DateTime local = value.Kind == DateTimeKind.Utc ? value.ToLocalTime() : value;
             return local.ToString("yyyy-MM-dd HH:mm");
+        }
+
+        private string FormatVaultSubtitle()
+        {
+            string mode = vault.StorageMode == PasswordVaultStorageMode.PlaintextJson ?
+                "明文 JSON" : "AES-256";
+            string fileName = Path.GetFileName(vault.StoragePath);
+            if (String.IsNullOrWhiteSpace(fileName)) fileName = vault.StoragePath;
+            return mode + "  |  " + fileName;
         }
 
         private static Label CreateFieldLabel(string text)

@@ -9,6 +9,10 @@
 # Local encrypted password vaults
 *.vault
 *.vault.*.tmp
+*.aesvault
+*.aesvault.*.tmp
+passwords.json
+.passwords.json.*.tmp
 
 # Visual Studio user state
 /.vs/

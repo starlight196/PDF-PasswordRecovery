@@ -6,6 +6,6 @@ if not exist "%CSC%" (
   exit /b 1
 )
 if not exist "bin" mkdir "bin"
-"%CSC%" /nologo /target:exe /platform:x64 /optimize+ /out:bin\CryptoSelfTest.exe /reference:System.dll /reference:System.Core.dll /reference:System.Security.dll src\PdfSecurity.cs src\DictionaryAttack.cs src\PasswordDocumentFingerprint.cs src\PasswordVault.cs tests\CryptoSelfTest.cs
+"%CSC%" /nologo /target:exe /platform:x64 /optimize+ /out:bin\CryptoSelfTest.exe /reference:System.dll /reference:System.Core.dll /reference:System.Runtime.Serialization.dll src\PdfSecurity.cs src\DictionaryAttack.cs src\PasswordDocumentFingerprint.cs src\PasswordVaultStorage.cs src\PasswordVault.cs tests\CryptoSelfTest.cs
 if errorlevel 1 exit /b 1
 bin\CryptoSelfTest.exe

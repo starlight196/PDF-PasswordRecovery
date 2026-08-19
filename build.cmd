@@ -8,6 +8,6 @@ if not exist "%CSC%" (
 if not exist "bin" mkdir "bin"
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\GenerateIcon.ps1
 if errorlevel 1 exit /b 1
-"%CSC%" /nologo /target:winexe /platform:x64 /optimize+ /win32icon:assets\PdfPasswordRecovery.ico /resource:assets\PdfPasswordRecovery.ico,PdfPasswordRecovery.AppIcon /out:bin\PdfPasswordRecovery.exe /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll /reference:System.Security.dll /reference:System.Windows.Forms.dll src\*.cs
+"%CSC%" /nologo /target:winexe /platform:x64 /optimize+ /win32icon:assets\PdfPasswordRecovery.ico /resource:assets\PdfPasswordRecovery.ico,PdfPasswordRecovery.AppIcon /out:bin\PdfPasswordRecovery.exe /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll /reference:System.Runtime.Serialization.dll /reference:System.Windows.Forms.dll src\*.cs
 if errorlevel 1 exit /b 1
 echo Built bin\PdfPasswordRecovery.exe

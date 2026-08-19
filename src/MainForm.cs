@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Text;
@@ -21,6 +22,8 @@ namespace PdfPasswordRecovery
         private static readonly Color DisabledInk = Color.FromArgb(126, 136, 143);
         private static readonly Color DisabledLine = Color.FromArgb(196, 204, 209);
         private const string EmptyPasswordDisplay = "（空密码）";
+        private static PasswordVaultStorageMode rememberedVaultMode = PasswordVaultStorageMode.Aes256;
+        private static string rememberedVaultPath = PasswordVault.DefaultAes256StoragePath;
 
         private readonly TextBox pdfPathBox = CreatePathBox();
         private readonly TextBox dictionaryPathBox = CreatePathBox();
@@ -52,7 +55,6 @@ namespace PdfPasswordRecovery
         private readonly Timer uiTimer = new Timer();
 
         private readonly DictionaryAttack attack = new DictionaryAttack();
-        private readonly PasswordVault passwordVault = new PasswordVault();
         private PdfSecurityInfo securityInfo;
         private DictionaryInfo dictionaryInfo;
         private int pdfLoadVersion;
@@ -701,10 +703,25 @@ namespace PdfPasswordRecovery
             PasswordRecord currentResult = CreateCurrentPasswordRecord();
             try
             {
-                using (PasswordManagerForm form = new PasswordManagerForm(passwordVault, currentResult))
+                using (PasswordVaultAccessForm accessForm = new PasswordVaultAccessForm(
+                    rememberedVaultMode, rememberedVaultPath))
                 {
-                    if (Icon != null) form.Icon = (Icon)Icon.Clone();
-                    form.ShowDialog(this);
+                    if (Icon != null) accessForm.Icon = (Icon)Icon.Clone();
+                    if (accessForm.ShowDialog(this) != DialogResult.OK) return;
+
+                    rememberedVaultMode = accessForm.SelectedMode;
+                    rememberedVaultPath = accessForm.SelectedPath;
+                    List<PasswordRecord> initialRecords = accessForm.InitialRecords;
+                    PasswordVault vault = accessForm.TakeVault();
+                    if (vault == null) throw new InvalidOperationException("密码库未成功打开。");
+
+                    using (vault)
+                    using (PasswordManagerForm form = new PasswordManagerForm(
+                        vault, currentResult, initialRecords))
+                    {
+                        if (Icon != null) form.Icon = (Icon)Icon.Clone();
+                        form.ShowDialog(this);
+                    }
                 }
             }
             catch (Exception ex)
