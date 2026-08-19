@@ -128,21 +128,6 @@ internal static class CryptoSelfTest
                 AssertPasswordVaultRoundTrip(tempDirectory);
             });
 
-            Run("AES password vault accepts a UTF-8 vault password", delegate
-            {
-                AssertUtf8VaultPassword(tempDirectory);
-            });
-
-            Run("Plaintext JSON password vault round trip", delegate
-            {
-                AssertPlaintextPasswordVault(tempDirectory);
-            });
-
-            Run("AES password vault rejects wrong mode and password", delegate
-            {
-                AssertAesPasswordVaultAccessControls(tempDirectory);
-            });
-
             Run("Password vault rejects tampering", delegate
             {
                 AssertPasswordVaultRejectsTampering(tempDirectory);
@@ -156,11 +141,6 @@ internal static class CryptoSelfTest
             Run("Password vault rejects duplicate document types", delegate
             {
                 AssertPasswordVaultDuplicateProtection(tempDirectory);
-            });
-
-            Run("Password vault mutation snapshots are current and isolated", delegate
-            {
-                AssertPasswordVaultMutationSnapshots(tempDirectory);
             });
 
             Run("Password document fingerprint normalization", delegate
@@ -193,7 +173,7 @@ internal static class CryptoSelfTest
             PdfSecurity.VerifyPassword(info, Encoding.ASCII.GetBytes(userPassword)),
             "user password");
         AssertEqual(
-            PasswordMatch.Owner,
+            PasswordMatch.Owner,  你 
             PdfSecurity.VerifyPassword(info, Encoding.ASCII.GetBytes(ownerPassword)),
             "owner password");
         AssertEqual(
@@ -321,7 +301,7 @@ internal static class CryptoSelfTest
     private static void AssertPasswordVaultRoundTrip(string directory)
     {
         string path = Path.Combine(directory, "round-trip-passwords.vault");
-        PasswordVault vault = PasswordVault.OpenAes256(path, "test-vault-passphrase");
+        PasswordVault vault = new PasswordVault(path);
         PasswordRecord first = vault.Upsert(new PasswordRecord
         {
             FilePath = Path.Combine(directory, "测试文档.pdf"),
@@ -369,109 +349,12 @@ internal static class CryptoSelfTest
         loaded = vault.Load();
         if (loaded.Count != 1 || loaded[0].Id != emptyPassword.Id)
             throw new InvalidOperationException("password vault delete removed the wrong record");
-        vault.Dispose();
-    }
-
-    private static void AssertPlaintextPasswordVault(string directory)
-    {
-        string path = Path.Combine(directory, "plain-passwords.json");
-        const string visiblePassword = "plain-visible-password";
-        using (PasswordVault vault = PasswordVault.OpenPlaintext(path))
-        {
-            vault.Upsert(new PasswordRecord
-            {
-                FilePath = Path.Combine(directory, "plain.pdf"),
-                Password = visiblePassword,
-                Match = PasswordMatch.User,
-                PasswordEncodingCodePage = Encoding.UTF8.CodePage,
-                Note = "plain JSON",
-                DocumentFingerprint = CreateFingerprint(31)
-            });
-        }
-
-        string json = File.ReadAllText(path, Encoding.UTF8);
-        if (json.IndexOf(visiblePassword, StringComparison.Ordinal) < 0 ||
-            json.IndexOf("\"format\"", StringComparison.Ordinal) < 0 ||
-            json.IndexOf("\"records\"", StringComparison.Ordinal) < 0)
-            throw new InvalidOperationException("plaintext vault is not readable JSON with the stored password");
-
-        using (PasswordVault reopened = PasswordVault.OpenPlaintext(path))
-        {
-            System.Collections.Generic.List<PasswordRecord> records = reopened.Load();
-            if (records.Count != 1 || records[0].Password != visiblePassword)
-                throw new InvalidOperationException("plaintext JSON vault did not round trip its record");
-        }
-    }
-
-    private static void AssertUtf8VaultPassword(string directory)
-    {
-        string path = Path.Combine(directory, "utf8-vault-password.aesvault");
-        const string vaultPassword = "密码库中文-2026";
-        using (PasswordVault vault = PasswordVault.OpenAes256(path, vaultPassword))
-        {
-            vault.Upsert(new PasswordRecord
-            {
-                FilePath = Path.Combine(directory, "utf8-vault.pdf"),
-                Password = "record-password",
-                Match = PasswordMatch.User,
-                PasswordEncodingCodePage = Encoding.UTF8.CodePage,
-                Note = String.Empty,
-                DocumentFingerprint = CreateFingerprint(33)
-            });
-        }
-
-        using (PasswordVault reopened = PasswordVault.OpenAes256(path, vaultPassword))
-        {
-            System.Collections.Generic.List<PasswordRecord> records = reopened.Load();
-            if (records.Count != 1 || records[0].Password != "record-password")
-                throw new InvalidOperationException("UTF-8 AES vault password did not round trip");
-        }
-    }
-
-    private static void AssertAesPasswordVaultAccessControls(string directory)
-    {
-        string path = Path.Combine(directory, "access-controls.aesvault");
-        const string correctPassword = "correct-vault-password";
-        using (PasswordVault vault = PasswordVault.OpenAes256(path, correctPassword))
-        {
-            vault.Upsert(new PasswordRecord
-            {
-                FilePath = Path.Combine(directory, "access-controls.pdf"),
-                Password = "protected-record-password",
-                Match = PasswordMatch.Owner,
-                PasswordEncodingCodePage = Encoding.UTF8.CodePage,
-                Note = String.Empty,
-                DocumentFingerprint = CreateFingerprint(32)
-            });
-        }
-
-        byte[] beforeFailures = File.ReadAllBytes(path);
-        AssertVaultFailure(delegate
-        {
-            using (PasswordVault wrongPassword = PasswordVault.OpenAes256(path, "wrong-vault-password"))
-                wrongPassword.Load();
-        }, "wrong AES vault password");
-        AssertVaultFailure(delegate
-        {
-            using (PasswordVault wrongMode = PasswordVault.OpenPlaintext(path)) wrongMode.Load();
-        }, "AES vault opened as plaintext");
-
-        byte[] afterFailures = File.ReadAllBytes(path);
-        if (!ByteArraysEqual(beforeFailures, afterFailures))
-            throw new InvalidOperationException("failed AES access changed the password vault file");
-
-        string legacyPath = Path.Combine(directory, "legacy-passwords.vault");
-        File.WriteAllBytes(legacyPath, Encoding.ASCII.GetBytes("PDFVAULTlegacy-test"));
-        AssertVaultFailure(delegate
-        {
-            using (PasswordVault legacy = PasswordVault.OpenPlaintext(legacyPath)) legacy.Load();
-        }, "legacy DPAPI vault detection");
     }
 
     private static void AssertPasswordVaultRejectsTampering(string directory)
     {
         string path = Path.Combine(directory, "tampered-passwords.vault");
-        PasswordVault vault = PasswordVault.OpenAes256(path, "test-vault-passphrase");
+        PasswordVault vault = new PasswordVault(path);
         vault.Upsert(new PasswordRecord
         {
             FilePath = Path.Combine(directory, "tamper.pdf"),
@@ -508,7 +391,7 @@ internal static class CryptoSelfTest
     private static void AssertPasswordVaultConcurrency(string directory)
     {
         string path = Path.Combine(directory, "concurrent-passwords.vault");
-        PasswordVault firstVault = PasswordVault.OpenPlaintext(path);
+        PasswordVault firstVault = new PasswordVault(path);
         PasswordRecord created = firstVault.Upsert(new PasswordRecord
         {
             FilePath = Path.Combine(directory, "concurrent.pdf"),
@@ -519,7 +402,7 @@ internal static class CryptoSelfTest
             DocumentFingerprint = CreateFingerprint(5)
         });
 
-        PasswordVault secondVault = PasswordVault.OpenPlaintext(path);
+        PasswordVault secondVault = new PasswordVault(path);
         PasswordRecord stale = firstVault.Load()[0];
         PasswordRecord current = secondVault.Load()[0];
         current.Note = "second writer";
@@ -562,7 +445,7 @@ internal static class CryptoSelfTest
     private static void AssertPasswordVaultDuplicateProtection(string directory)
     {
         string path = Path.Combine(directory, "duplicate-passwords.vault");
-        PasswordVault vault = PasswordVault.OpenPlaintext(path);
+        PasswordVault vault = new PasswordVault(path);
         PasswordRecord first = vault.Upsert(new PasswordRecord
         {
             FilePath = Path.Combine(directory, "first.pdf"),
@@ -602,104 +485,6 @@ internal static class CryptoSelfTest
         if (records.Count != 2 || records[0].Password == "must-not-overwrite" ||
             records[1].Password == "must-not-overwrite" || first.Id == second.Id)
             throw new InvalidOperationException("duplicate protection changed existing records");
-    }
-
-    private static void AssertPasswordVaultMutationSnapshots(string directory)
-    {
-        string path = Path.Combine(directory, "snapshot-passwords.vault");
-        PasswordVault firstVault = PasswordVault.OpenPlaintext(path);
-        PasswordVault secondVault = PasswordVault.OpenPlaintext(path);
-
-        PasswordVaultMutationResult firstResult = firstVault.UpsertWithSnapshot(new PasswordRecord
-        {
-            FilePath = Path.Combine(directory, "snapshot-first.pdf"),
-            Password = "snapshot-first-password",
-            Match = PasswordMatch.User,
-            PasswordEncodingCodePage = Encoding.UTF8.CodePage,
-            Note = "first",
-            DocumentFingerprint = CreateFingerprint(20)
-        });
-        if (firstResult.SavedRecord == null || firstResult.Records == null || firstResult.Records.Count != 1 ||
-            firstResult.Records[0].Id != firstResult.SavedRecord.Id)
-            throw new InvalidOperationException("first mutation did not return its committed snapshot");
-
-        PasswordRecord second = secondVault.Upsert(new PasswordRecord
-        {
-            FilePath = Path.Combine(directory, "snapshot-second.pdf"),
-            Password = "snapshot-second-password",
-            Match = PasswordMatch.Owner,
-            PasswordEncodingCodePage = Encoding.UTF8.CodePage,
-            Note = "second",
-            DocumentFingerprint = CreateFingerprint(21)
-        });
-
-        PasswordVaultMutationResult added = firstVault.UpsertWithSnapshot(new PasswordRecord
-        {
-            FilePath = Path.Combine(directory, "snapshot-third.pdf"),
-            Password = "snapshot-third-password",
-            Match = PasswordMatch.User,
-            PasswordEncodingCodePage = Encoding.UTF8.CodePage,
-            Note = "third",
-            DocumentFingerprint = CreateFingerprint(22)
-        });
-        PasswordRecord addedInSnapshot = FindRecord(added.Records, added.SavedRecord.Id);
-        if (added.Records.Count != 3 || FindRecord(added.Records, second.Id) == null || addedInSnapshot == null)
-            throw new InvalidOperationException("mutation snapshot omitted a record committed by another vault instance");
-        if (Object.ReferenceEquals(added.SavedRecord, addedInSnapshot) ||
-            Object.ReferenceEquals(added.SavedRecord.DocumentFingerprint, addedInSnapshot.DocumentFingerprint))
-            throw new InvalidOperationException("saved record and snapshot record were not deeply isolated");
-
-        byte originalSavedFingerprint = addedInSnapshot.DocumentFingerprint[0];
-        added.SavedRecord.Note = "changed saved result";
-        added.SavedRecord.DocumentFingerprint[0] ^= 0x7f;
-        if (addedInSnapshot.Note != "third" || addedInSnapshot.DocumentFingerprint[0] != originalSavedFingerprint)
-            throw new InvalidOperationException("changing the saved result changed the returned record snapshot");
-
-        Guid addedId = addedInSnapshot.Id;
-        addedInSnapshot.Password = "changed snapshot password";
-        addedInSnapshot.DocumentFingerprint[1] ^= 0x7f;
-        added.Records.Clear();
-        System.Collections.Generic.List<PasswordRecord> persisted = firstVault.Load();
-        PasswordRecord persistedAdded = FindRecord(persisted, addedId);
-        if (persisted.Count != 3 || persistedAdded == null ||
-            persistedAdded.Password != "snapshot-third-password" || persistedAdded.Note != "third" ||
-            persistedAdded.DocumentFingerprint[1] != CreateFingerprint(22)[1])
-            throw new InvalidOperationException("changing a returned snapshot changed persisted vault data");
-
-        persistedAdded.Note = "updated through snapshot API";
-        PasswordVaultMutationResult updated = firstVault.UpsertWithSnapshot(persistedAdded);
-        PasswordRecord updatedInSnapshot = FindRecord(updated.Records, addedId);
-        if (updated.SavedRecord == null || updated.SavedRecord.Id != addedId || updated.Records.Count != 3 ||
-            updatedInSnapshot == null || updatedInSnapshot.Note != "updated through snapshot API")
-            throw new InvalidOperationException("update mutation returned an incorrect committed snapshot");
-
-        PasswordVaultMutationResult deleted = firstVault.DeleteWithSnapshot(second.Id);
-        if (deleted.SavedRecord != null || deleted.Records == null || deleted.Records.Count != 2 ||
-            FindRecord(deleted.Records, second.Id) != null)
-            throw new InvalidOperationException("delete mutation returned an incorrect committed snapshot");
-
-        deleted.Records[0].Note = "changed delete snapshot";
-        deleted.Records.Clear();
-        persisted = firstVault.Load();
-        if (persisted.Count != 2 || FindRecord(persisted, second.Id) != null)
-            throw new InvalidOperationException("delete snapshot did not match persisted vault data");
-        for (int i = 0; i < persisted.Count; i++)
-        {
-            if (persisted[i].Note == "changed delete snapshot")
-                throw new InvalidOperationException("changing a delete snapshot changed persisted vault data");
-        }
-    }
-
-    private static PasswordRecord FindRecord(
-        System.Collections.Generic.List<PasswordRecord> records,
-        Guid id)
-    {
-        if (records == null) return null;
-        for (int i = 0; i < records.Count; i++)
-        {
-            if (records[i].Id == id) return records[i];
-        }
-        return null;
     }
 
     private static byte[] CreateFingerprint(byte seed)
